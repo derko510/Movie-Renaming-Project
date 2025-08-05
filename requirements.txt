@@ -1,0 +1,6 @@
+# Core dependencies
+python-dotenv==1.0.0
+tmdbv3api==1.9.0
+requests==2.31.0
+
+# Local AI with Ollama (no additional Python packages needed)
