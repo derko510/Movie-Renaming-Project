@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # Real season/episode counts
-declare -A got_season_eps=([1]=10 [2]=10 [3]=10 [4]=10 [5]=10 [6]=10 [7]=7 [8]=6)
-declare -A ram_season_eps=([1]=11 [2]=10 [3]=10 [4]=10 [5]=10 [6]=10 [7]=10)
-declare -A sl_season_eps=([1]=12 [2]=12)
+# declare -A got_season_eps=([1]=10 [2]=10 [3]=10 [4]=10 [5]=10 [6]=10 [7]=7 [8]=6)
+# declare -A ram_season_eps=([1]=11 [2]=10 [3]=10 [4]=10 [5]=10 [6]=10 [7]=10)
+declare -A sl_season_eps=([2]=13)
 
 EP_TOTAL=5
 

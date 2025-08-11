@@ -15,7 +15,7 @@ from tmdbv3api import TMDb, TV, Episode
 # Ollama integration
 import subprocess
 import json
-OLLAMA_MODEL = "gpt-oss:20b"
+OLLAMA_MODEL = "qwen2.5:7b"
 
 # ----------------------
 # Load .env variables
@@ -318,8 +318,8 @@ def rename_show_files(show_name: str, files: List[Path], dry_run: bool = False, 
     """Rename all files for a specific show."""
     logging.info(f"\nProcessing show: {show_name} ({len(files)} files)")
     
-    # Create before/after log
-    log_entries = []
+    # Create log for unparsed files only
+    unparsed_files = []
     
     # Get show info to determine if continuous numbering is needed
     show_info = get_show_info(show_name)
@@ -337,6 +337,12 @@ def rename_show_files(show_name: str, files: List[Path], dry_run: bool = False, 
         episode_info = extract_episode_info(filename)
         if not episode_info:
             logging.warning(f"Skipping '{filename}': no episode info found")
+            # Log unparsed file
+            unparsed_files.append({
+                'filename': filename,
+                'reason': 'Could not extract episode info',
+                'show': show_name
+            })
             continue
         
         detected_season, detected_episode = episode_info
@@ -435,14 +441,6 @@ def rename_show_files(show_name: str, files: List[Path], dry_run: bool = False, 
             logging.info(f"Already named correctly: {filename}")
             continue
         
-        log_entries.append({
-            'original': filename,
-            'detected': f"S{detected_season:02d}E{detected_episode:02d}",
-            'final': f"S{final_season:02d}E{final_episode:02d}",
-            'new_name': new_name,
-            'title': title
-        })
-        
         logging.info(f"{'[DRY RUN] ' if dry_run else ''}Renaming: {filename} -> {new_name}")
         
         if not dry_run:
@@ -450,25 +448,34 @@ def rename_show_files(show_name: str, files: List[Path], dry_run: bool = False, 
                 file_path.rename(new_path)
             except Exception as e:
                 logging.error(f"Failed to rename '{filename}': {e}")
+                # Log failed rename
+                unparsed_files.append({
+                    'filename': filename,
+                    'reason': f'Rename failed: {e}',
+                    'show': show_name
+                })
     
-    # Write to log file
-    if log_entries and log_file_path:
-        write_rename_log(log_file_path, show_name, log_entries)
+    # Write unparsed files log if any
+    if unparsed_files and log_file_path:
+        write_unparsed_log(log_file_path, show_name, unparsed_files)
 
-def write_rename_log(log_file_path: Path, show_name: str, log_entries: List[Dict]):
-    """Write rename log to file."""
+def write_unparsed_log(log_file_path: Path, show_name: str, unparsed_files: List[Dict]):
+    """Write unparsed files log to file."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     log_data = {
         'timestamp': timestamp,
         'show_name': show_name,
-        'total_files': len(log_entries),
-        'entries': log_entries
+        'unparsed_count': len(unparsed_files),
+        'unparsed_files': unparsed_files
     }
     
+    # Create unparsed files log file name
+    unparsed_log_path = log_file_path.parent / f"unparsed_{log_file_path.name}"
+    
     # Append to existing log file or create new one
-    if log_file_path.exists():
-        with open(log_file_path, 'r') as f:
+    if unparsed_log_path.exists():
+        with open(unparsed_log_path, 'r') as f:
             existing_data = json.load(f)
         if not isinstance(existing_data, list):
             existing_data = [existing_data]
@@ -476,10 +483,10 @@ def write_rename_log(log_file_path: Path, show_name: str, log_entries: List[Dict
     else:
         existing_data = [log_data]
     
-    with open(log_file_path, 'w') as f:
+    with open(unparsed_log_path, 'w') as f:
         json.dump(existing_data, f, indent=2)
     
-    logging.info(f"Logged {len(log_entries)} renames to {log_file_path}")
+    logging.warning(f"Logged {len(unparsed_files)} unparsed files to {unparsed_log_path}")
 
 def main():
     parser = argparse.ArgumentParser(description='TMDb Video Renamer - Automatically rename video files with TMDb metadata')
@@ -516,8 +523,8 @@ def main():
     for show_name, files in show_files.items():
         logging.info(f"  - {show_name}: {len(files)} files")
     
-    # Create log file
-    log_file = root_path / f"rename_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    # Create log file for unparsed files only
+    log_file = root_path / f"unparsed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     
     # Process each show
     total_files = sum(len(files) for files in show_files.values())
