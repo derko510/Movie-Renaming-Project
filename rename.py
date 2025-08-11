@@ -122,6 +122,78 @@ def get_show_info(show_name: str) -> Optional[Dict]:
         logging.error(f"Error searching for show '{show_name}': {e}")
         return None
 
+def ask_ollama_for_anime_mapping(show_info: Dict, detected_season: int, detected_episode: int) -> Optional[int]:
+    """
+    Use Ollama to analyze TMDb season data and determine correct continuous episode numbering for anime.
+    """
+    prompt = f"""You are an expert at anime episode numbering. Analyze this TMDb data for an anime show:
+
+Show: {show_info['name']}
+TMDb Season Data: {show_info['seasons']}
+Total Episodes in TMDb: {show_info['total_episodes']}
+
+The file shows: Season {detected_season} Episode {detected_episode}
+
+TASK: Determine the correct continuous episode number for Season 1.
+
+CONTEXT:
+- Anime typically has 12-13 episodes per season (called "cours")
+- TMDb often incorrectly combines multiple seasons/cours into one season
+- For continuous numbering: Season 2 Episode 1 = Season 1's episode count + 1
+- Most anime: Season 1 = episodes 1-12, Season 2 = episodes 13-24, etc.
+
+CRITICAL: If TMDb shows Season 1 with 24-26 episodes, it likely combined 2 seasons worth of episodes.
+In this case, use 12 episodes per season for calculation, NOT the TMDb count.
+
+ANALYSIS:
+- If Season 1 shows 12-13 episodes: Use that count
+- If Season 1 shows 24-26 episodes: It's likely 2 seasons combined, use 12 per season
+- For Season {detected_season} Episode {detected_episode}: Calculate as (Season-1) × 12 + Episode
+
+What continuous episode number should Season {detected_season} Episode {detected_episode} be?
+
+Respond with ONLY the episode number (e.g., "15" for episode 15).
+If unsure, respond: UNKNOWN"""
+
+    try:
+        result = subprocess.run([
+            'ollama', 'run', OLLAMA_MODEL, prompt
+        ], capture_output=True, text=True, timeout=30)
+        
+        if result.returncode != 0:
+            logging.warning(f"Ollama error for anime mapping: {result.stderr}")
+            return None
+        
+        response = result.stdout.strip()
+        
+        if response == "UNKNOWN":
+            return None
+        
+        # Extract the last number from the response (in case there's extra text)
+        import re
+        numbers = re.findall(r'\b\d+\b', response)
+        if numbers:
+            try:
+                continuous_ep = int(numbers[-1])  # Take the last number found
+                if 1 <= continuous_ep <= 200:  # Reasonable range
+                    logging.info(f"Ollama suggested continuous episode: {continuous_ep}")
+                    return continuous_ep
+                else:
+                    logging.warning(f"Ollama returned unreasonable episode number: {continuous_ep}")
+                    return None
+            except ValueError:
+                pass
+        
+        logging.warning(f"Ollama returned non-numeric response: {response[:100]}...")
+        return None
+            
+    except subprocess.TimeoutExpired:
+        logging.warning("Ollama timeout for anime mapping")
+        return None
+    except Exception as e:
+        logging.warning(f"Ollama error for anime mapping: {e}")
+        return None
+
 def get_episode_title(show_name: str, season: int, episode: int) -> Optional[str]:
     """Get episode title from TMDb API."""
     show_info = get_show_info(show_name)
@@ -167,7 +239,7 @@ CRITICAL RULES:
 5. Focus on the main season/episode identifier in the filename
 
 OUTPUT FORMAT: S##E## (exactly this format with zero-padded numbers)
-EXAMPLES: S01E04, S02E15, S01E23, S03E01
+EXAMPLES: S01EP04, S02EP15, S01EP23, S03EP01
 
 If no season/episode pattern found, respond: NONE"""
     
@@ -269,30 +341,50 @@ def rename_show_files(show_name: str, files: List[Path], dry_run: bool = False, 
         
         detected_season, detected_episode = episode_info
         
-        # For anime, always use Season 1 and calculate continuous episode numbering
+        # For anime, always use Season 1 with LLM-determined continuous numbering
         if is_anime:
-            # Calculate continuous episode number from detected season/episode
-            continuous_ep = detected_episode
-            if detected_season > 1:
-                # Add episodes from previous seasons to get continuous numbering
-                for prev_season in range(1, detected_season):
-                    if prev_season in show_info['seasons']:
-                        continuous_ep += show_info['seasons'][prev_season]
+            # Use LLM to analyze TMDb data and determine correct continuous episode number
+            continuous_ep = ask_ollama_for_anime_mapping(show_info, detected_season, detected_episode)
             
-            # Always use season 1 for anime (API lookup and output)
-            final_season = 1
-            final_episode = continuous_ep
-            logging.info(f"Anime continuous numbering: S{detected_season:02d}E{detected_episode:02d} -> S01E{continuous_ep:02d}")
+            if continuous_ep:
+                # LLM provided a mapping
+                final_season = 1
+                final_episode = continuous_ep
+                logging.info(f"LLM anime mapping: S{detected_season:02d}E{detected_episode:02d} -> S01EP{continuous_ep:03d}")
+            else:
+                # Fallback to simple calculation (12 episodes per season)
+                continuous_ep = detected_episode
+                if detected_season > 1:
+                    continuous_ep += (detected_season - 1) * 12
+                final_season = 1
+                final_episode = continuous_ep
+                logging.info(f"Fallback anime mapping: S{detected_season:02d}E{detected_episode:02d} -> S01EP{continuous_ep:03d}")
         else:
             # For regular TV shows, use detected season/episode as-is
             final_season = detected_season
             final_episode = detected_episode
         
-        # Get episode title
+        # Get episode title with fallback for anime
         title = get_episode_title(show_name, final_season, final_episode)
+        
+        # If anime continuous numbering failed, try original season/episode
+        if not title and is_anime and final_season == 1:
+            logging.info(f"Continuous numbering failed, trying original S{detected_season:02d}EP{detected_episode:03d}")
+            title = get_episode_title(show_name, detected_season, detected_episode)
+            if title:
+                # Use the original season/episode that worked
+                final_season = detected_season
+                final_episode = detected_episode
+                logging.info(f"Using original season/episode for output")
+            else:
+                # No title found anywhere - use original season/episode for filename consistency
+                final_season = detected_season
+                final_episode = detected_episode
+                logging.info(f"No title found, using original S{detected_season:02d}EP{detected_episode:03d} for filename")
+        
         if not title:
-            logging.warning(f"Title not found for S{final_season:02d}E{final_episode:02d} - using generic")
-            title = f"Episode {final_episode}"
+            logging.warning(f"Title not found for S{final_season:02d}EP{final_episode:03d} - using generic")
+            title = f"{final_episode}"
         
         # Clean up title for filename
         safe_title = re.sub(r'[^A-Za-z0-9\s]', '', title)
@@ -306,20 +398,36 @@ def rename_show_files(show_name: str, files: List[Path], dry_run: bool = False, 
         clean_show_name = re.sub(r'[^A-Za-z0-9\s]', '', show_name)
         clean_show_name = re.sub(r'\s+', '.', clean_show_name)
         
-        # Build filename with optional resolution
-        if resolution:
-            new_name = f"{clean_show_name}.S{final_season:02d}E{final_episode:02d}.{safe_title}.{resolution}{suffix}"
+        # Build filename with optional resolution (use EP format for episodes) 
+        if safe_title and safe_title != str(final_episode):
+            # Use episode title if available and not just the episode number
+            if resolution:
+                new_name = f"{clean_show_name}.S{final_season:02d}EP{final_episode:03d}.{safe_title}.{resolution}{suffix}"
+            else:
+                new_name = f"{clean_show_name}.S{final_season:02d}EP{final_episode:03d}.{safe_title}{suffix}"
         else:
-            new_name = f"{clean_show_name}.S{final_season:02d}E{final_episode:02d}.{safe_title}{suffix}"
+            # No title or title is just episode number - omit it
+            if resolution:
+                new_name = f"{clean_show_name}.S{final_season:02d}EP{final_episode:03d}.{resolution}{suffix}"
+            else:
+                new_name = f"{clean_show_name}.S{final_season:02d}EP{final_episode:03d}{suffix}"
+        
+        logging.debug(f"Debug: show_name='{show_name}', clean_show_name='{clean_show_name}', safe_title='{safe_title}', new_name='{new_name}'")
         new_path = file_path.parent / new_name
         
         # Handle name collisions
         counter = 1
         while new_path.exists() and new_path != file_path:
-            if resolution:
-                new_name = f"{clean_show_name}.S{final_season:02d}E{final_episode:02d}.{safe_title}_{counter}.{resolution}{suffix}"
+            if safe_title and safe_title != str(final_episode):
+                if resolution:
+                    new_name = f"{clean_show_name}.S{final_season:02d}EP{final_episode:03d}.{safe_title}_{counter}.{resolution}{suffix}"
+                else:
+                    new_name = f"{clean_show_name}.S{final_season:02d}EP{final_episode:03d}.{safe_title}_{counter}{suffix}"
             else:
-                new_name = f"{clean_show_name}.S{final_season:02d}E{final_episode:02d}.{safe_title}_{counter}{suffix}"
+                if resolution:
+                    new_name = f"{clean_show_name}.S{final_season:02d}EP{final_episode:03d}_{counter}.{resolution}{suffix}"
+                else:
+                    new_name = f"{clean_show_name}.S{final_season:02d}EP{final_episode:03d}_{counter}{suffix}"
             new_path = file_path.parent / new_name
             counter += 1
         
