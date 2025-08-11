@@ -10,12 +10,12 @@ from typing import Optional, Tuple, Dict, List
 from collections import defaultdict
 
 from dotenv import load_dotenv
-from tmdbv3api import TMDb, TV
+from tmdbv3api import TMDb, TV, Episode
 
 # Ollama integration
 import subprocess
 import json
-OLLAMA_MODEL = "llama3.2:3b"
+OLLAMA_MODEL = "gpt-oss:20b"
 
 # ----------------------
 # Load .env variables
@@ -57,6 +57,7 @@ tmdb = TMDb()
 tmdb.api_key = TMDB_API_KEY
 tmdb.language = "en"
 tv = TV()
+episode_api = Episode()
 
 
 # ----------------------
@@ -122,44 +123,19 @@ def get_show_info(show_name: str) -> Optional[Dict]:
         return None
 
 def get_episode_title(show_name: str, season: int, episode: int) -> Optional[str]:
-    """Get episode title, handling cross-season numbering for anime."""
+    """Get episode title from TMDb API."""
     show_info = get_show_info(show_name)
     if not show_info:
         return None
     
     try:
-        # For anime with continuous numbering, find the actual season/episode
-        if show_info['is_anime'] and len(show_info['seasons']) > 1:
-            actual_season, actual_episode = map_continuous_to_actual(episode, show_info['seasons'])
-            if actual_season and actual_episode:
-                logging.info(f"Anime mapping: Episode {episode} -> S{actual_season:02d}E{actual_episode:02d}")
-                season, episode = actual_season, actual_episode
-        
-        # Try different TMDb API methods
-        try:
-            episode_details = tv.episode_details(show_info['id'], season, episode)
-            return episode_details.name
-        except:
-            try:
-                # Fallback method
-                episode_info = tv.episode(show_info['id'], season, episode)
-                return episode_info.name if hasattr(episode_info, 'name') else None
-            except:
-                return None
+        # Get episode details using Episode API
+        episode_details = episode_api.details(show_info['id'], season, episode)
+        return episode_details.name if hasattr(episode_details, 'name') else None
     except Exception as e:
-        logging.warning(f"Error fetching title for S{season:02d}E{episode:02d}: {e}")
+        logging.warning(f"Error fetching episode details for S{season:02d}E{episode:02d}: {e}")
         return None
 
-def map_continuous_to_actual(continuous_episode: int, seasons: Dict[int, int]) -> Tuple[Optional[int], Optional[int]]:
-    """Map continuous episode number to actual season/episode."""
-    episode_count = 0
-    for season_num in sorted(seasons.keys()):
-        season_episodes = seasons[season_num]
-        if continuous_episode <= episode_count + season_episodes:
-            actual_episode = continuous_episode - episode_count
-            return season_num, actual_episode
-        episode_count += season_episodes
-    return None, None
 
 def extract_episode_info(filename: str) -> Optional[Tuple[int, int]]:
     """
@@ -172,20 +148,28 @@ def ask_ollama_for_episode_info(filename: str) -> Optional[Tuple[int, int]]:
     """
     Use Ollama to extract season/episode from filename.
     """
-    prompt = f"""Extract ONLY the season and episode numbers from this filename: {filename}
+    prompt = f"""You are an expert at extracting season and episode numbers from video filenames. 
 
-Look for patterns like:
-- S01E05 (season 1, episode 5)
-- 1x05 (season 1, episode 5) 
-- S2E10 (season 2, episode 10)
-- season1episode5
+FILENAME: {filename}
 
-CRITICAL: Read the numbers carefully. S01E04 means season 1 episode 4, NOT season 4 episode 4.
+Extract the season and episode numbers. Look for these patterns:
+- S01E05, S1E5, S2E10 (season/episode format)
+- 1x05, 2x10 (season x episode format)  
+- E05, EP05, Episode05 (episode only - assume season 1)
+- 05, 005 (just numbers - assume season 1)
+- season1episode5, s1e5 (written out)
 
-Return EXACTLY in this format: S##E##
-Examples: S01E04, S02E10, S03E01
+CRITICAL RULES:
+1. Read numbers carefully: S01E04 = season 1 episode 4, NOT season 4 episode 4
+2. If filename shows S2E15, S3E08, etc. - extract the EXACT season and episode shown
+3. If only episode number found (no season), assume season 1
+4. Ignore extra numbers like years (2024), resolution (1080p), or codec info
+5. Focus on the main season/episode identifier in the filename
 
-If you cannot find clear season/episode numbers, respond: NONE"""
+OUTPUT FORMAT: S##E## (exactly this format with zero-padded numbers)
+EXAMPLES: S01E04, S02E15, S01E23, S03E01
+
+If no season/episode pattern found, respond: NONE"""
     
     try:
         result = subprocess.run([
@@ -271,8 +255,8 @@ def rename_show_files(show_name: str, files: List[Path], dry_run: bool = False, 
         logging.error(f"Could not find show '{show_name}' on TMDb - skipping")
         return
     
-    use_continuous = show_info['is_anime'] and len(show_info['seasons']) > 1
-    logging.info(f"Using {'continuous' if use_continuous else 'standard'} numbering")
+    is_anime = show_info['is_anime']
+    logging.info(f"Processing {'anime' if is_anime else 'regular TV show'}: {show_name}")
     
     for file_path in files:
         filename = file_path.name
@@ -285,20 +269,22 @@ def rename_show_files(show_name: str, files: List[Path], dry_run: bool = False, 
         
         detected_season, detected_episode = episode_info
         
-        # For continuous numbering, calculate the absolute episode number
-        if use_continuous:
+        # For anime, always use Season 1 and calculate continuous episode numbering
+        if is_anime:
             # Calculate continuous episode number from detected season/episode
             continuous_ep = detected_episode
             if detected_season > 1:
-                # Add episodes from previous seasons
+                # Add episodes from previous seasons to get continuous numbering
                 for prev_season in range(1, detected_season):
                     if prev_season in show_info['seasons']:
                         continuous_ep += show_info['seasons'][prev_season]
             
-            # Use season 1 for output, but continuous episode number
+            # Always use season 1 for anime (API lookup and output)
             final_season = 1
             final_episode = continuous_ep
+            logging.info(f"Anime continuous numbering: S{detected_season:02d}E{detected_episode:02d} -> S01E{continuous_ep:02d}")
         else:
+            # For regular TV shows, use detected season/episode as-is
             final_season = detected_season
             final_episode = detected_episode
         
